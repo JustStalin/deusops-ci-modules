@@ -47,7 +47,11 @@
     - |
       for url in ${SMOKE_URLS}; do
         deadline=$((SECONDS + ${SMOKE_TIMEOUT:-180}))
-        until curl -fsS "${url}" >/tmp/smoke-response.txt; do
+        until if [ -n "${SMOKE_DOCKER_NETWORK:-}" ]; then
+          docker run --rm --network "${SMOKE_DOCKER_NETWORK}" curlimages/curl:8.12.1 -fsS "${url}" >/tmp/smoke-response.txt
+        else
+          curl -fsS "${url}" >/tmp/smoke-response.txt
+        fi; do
           if [ "${SECONDS}" -ge "${deadline}" ]; then
             docker compose -f "${COMPOSE_FILE}" logs --no-color > docker-compose.log || true
             cat docker-compose.log || true
