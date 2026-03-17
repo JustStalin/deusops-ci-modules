@@ -1,0 +1,60 @@
+.docker-compose-deploy:
+  image: docker:28-cli
+  services:
+    - name: docker:28-dind
+      alias: docker
+  stage: deploy
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    DEPLOY_MODE: local
+  before_script:
+    - apk add --no-cache bash openssh-client rsync
+    - test -n "${DEPLOY_COMPOSE_FILE:-}"
+  script:
+    - |
+      set -eu
+      GENERATED_ENV_FILE="${GENERATED_ENV_FILE:-.generated-deploy.env}"
+      : > "${GENERATED_ENV_FILE}"
+      if [ -n "${DEPLOY_ENV_FILE:-}" ] && [ -f "${DEPLOY_ENV_FILE}" ]; then
+        cat "${DEPLOY_ENV_FILE}" > "${GENERATED_ENV_FILE}"
+      fi
+      for var_name in ${DEPLOY_DYNAMIC_ENV_VARS:-}; do
+        eval "var_value=\${${var_name}:-}"
+        if [ -n "${var_value}" ]; then
+          printf '%s=%s\n' "${var_name}" "${var_value}" >> "${GENERATED_ENV_FILE}"
+        fi
+      done
+      if [ "${DEPLOY_MODE}" = "local" ]; then
+        if [ -n "${CI_REGISTRY:-}" ] && [ -n "${CI_REGISTRY_USER:-}" ] && [ -n "${CI_REGISTRY_PASSWORD:-}" ]; then
+          echo "${CI_REGISTRY_PASSWORD}" | docker login -u "${CI_REGISTRY_USER}" --password-stdin "${CI_REGISTRY}"
+        fi
+        docker compose --env-file "${GENERATED_ENV_FILE}" -f "${DEPLOY_COMPOSE_FILE}" pull || true
+        docker compose --env-file "${GENERATED_ENV_FILE}" -f "${DEPLOY_COMPOSE_FILE}" up -d --remove-orphans
+        docker compose --env-file "${GENERATED_ENV_FILE}" -f "${DEPLOY_COMPOSE_FILE}" ps > deploy-status.log
+      else
+        test -n "${DEPLOY_HOST:-}"
+        test -n "${DEPLOY_USER:-}"
+        test -n "${DEPLOY_PATH:-}"
+        test -n "${DEPLOY_SSH_PRIVATE_KEY:-}"
+        mkdir -p ~/.ssh
+        printf '%s\n' "${DEPLOY_SSH_PRIVATE_KEY}" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        ssh-keyscan -H "${DEPLOY_HOST}" >> ~/.ssh/known_hosts
+        rsync -az "${DEPLOY_SOURCE_DIR:-deploy/}" "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
+        rsync -az "${GENERATED_ENV_FILE}" "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/${GENERATED_ENV_FILE}"
+        ssh "${DEPLOY_USER}@${DEPLOY_HOST}" "\
+          set -eu; \
+          cd '${DEPLOY_PATH}'; \
+          if [ -n '${CI_REGISTRY:-}' ] && [ -n '${CI_REGISTRY_USER:-}' ] && [ -n '${CI_REGISTRY_PASSWORD:-}' ]; then \
+            echo '${CI_REGISTRY_PASSWORD}' | docker login -u '${CI_REGISTRY_USER}' --password-stdin '${CI_REGISTRY}'; \
+          fi; \
+          docker compose --env-file '${GENERATED_ENV_FILE}' -f '${DEPLOY_COMPOSE_FILE}' pull || true; \
+          docker compose --env-file '${GENERATED_ENV_FILE}' -f '${DEPLOY_COMPOSE_FILE}' up -d --remove-orphans; \
+          docker compose --env-file '${GENERATED_ENV_FILE}' -f '${DEPLOY_COMPOSE_FILE}' ps > deploy-status.log"
+      fi
+  artifacts:
+    when: always
+    paths:
+      - deploy-status.log

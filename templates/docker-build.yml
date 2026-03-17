@@ -1,0 +1,66 @@
+.docker-job-base:
+  image: docker:28-cli
+  services:
+    - name: docker:28-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    DOCKER_BUILDKIT: "1"
+    GIT_SUBMODULE_STRATEGY: recursive
+
+.docker-build-and-push:
+  extends: .docker-job-base
+  stage: build
+  before_script:
+    - test -n "${IMAGE_NAME:-}"
+    - test -n "${BUILD_CONTEXT:-}"
+    - test -n "${DOCKERFILE_PATH:-}"
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - export IMAGE_REF="${CI_REGISTRY_IMAGE}/${IMAGE_NAME}"
+    - export IMAGE_TAG="${IMAGE_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - |
+      TARGET_ARG=""
+      if [ -n "${TARGET_STAGE:-}" ]; then
+        TARGET_ARG="--target ${TARGET_STAGE}"
+      fi
+      docker build --pull -f "${DOCKERFILE_PATH}" ${TARGET_ARG} ${DOCKER_BUILD_ARGS:-} -t "${IMAGE_REF}:${IMAGE_TAG}" "${BUILD_CONTEXT}"
+    - docker push "${IMAGE_REF}:${IMAGE_TAG}"
+    - |
+      if [ -n "${LATEST_TAG:-}" ] && [ "${CI_COMMIT_BRANCH:-}" = "${CI_DEFAULT_BRANCH:-main}" -o "${CI_COMMIT_BRANCH:-}" = "dev" ]; then
+        docker tag "${IMAGE_REF}:${IMAGE_TAG}" "${IMAGE_REF}:${LATEST_TAG}"
+        docker push "${IMAGE_REF}:${LATEST_TAG}"
+      fi
+
+.docker-compose-smoke-test:
+  extends: .docker-job-base
+  stage: test
+  before_script:
+    - apk add --no-cache bash curl
+    - test -n "${COMPOSE_FILE:-}"
+    - test -n "${SMOKE_URLS:-}"
+  script:
+    - docker compose -f "${COMPOSE_FILE}" config
+    - docker compose -f "${COMPOSE_FILE}" up --build -d
+    - |
+      for url in ${SMOKE_URLS}; do
+        deadline=$((SECONDS + ${SMOKE_TIMEOUT:-180}))
+        until curl -fsS "${url}" >/tmp/smoke-response.txt; do
+          if [ "${SECONDS}" -ge "${deadline}" ]; then
+            docker compose -f "${COMPOSE_FILE}" logs --no-color > docker-compose.log || true
+            cat docker-compose.log || true
+            exit 1
+          fi
+          sleep 5
+        done
+        cat /tmp/smoke-response.txt
+      done
+    - docker compose -f "${COMPOSE_FILE}" logs --no-color > docker-compose.log
+  after_script:
+    - docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans || true
+  artifacts:
+    when: always
+    paths:
+      - docker-compose.log
